@@ -13,6 +13,7 @@
 
 #include "backports/StartsWithAndEndsWith.h"
 #include "backports/algorithm.h"
+#include "engine/ColumnStrippingHelpers.h"
 #include "engine/Distinct.h"
 #include "engine/IndexScan.h"
 #include "engine/MaterializedViews.h"
@@ -138,10 +139,20 @@ QueryExecutionTree::getUpdatedQueryExecutionTreeWithPrefilterApplied(
 
   if (prefilterPairs.empty()) {
     return std::nullopt;
-  } else {
-    return rootOperation_->getUpdatedQueryExecutionTreeWithPrefilterApplied(
-        prefilterPairs);
   }
+  auto result =
+      rootOperation_->getUpdatedQueryExecutionTreeWithPrefilterApplied(
+          prefilterPairs);
+  if (result.has_value()) {
+    AD_CORRECTNESS_CHECK(result.value() != nullptr);
+    // The prefiltered tree has a new root operation, on which the variables
+    // that are hidden in this tree would be visible again.
+    rootOperation_->keepHiddenVariablesHidden(
+        *result.value()->getRootOperation());
+    AD_CORRECTNESS_CHECK(result.value()->getVariableColumns() ==
+                         getVariableColumns());
+  }
+  return result;
 }
 
 // _____________________________________________________________________________
@@ -154,7 +165,7 @@ bool QueryExecutionTree::knownEmptyResult() {
 }
 
 // _____________________________________________________________________________
-bool QueryExecutionTree::isVariableCovered(Variable variable) const {
+bool QueryExecutionTree::containsVariable(Variable variable) const {
   return getVariableColumns().contains(variable);
 }
 
@@ -197,7 +208,7 @@ void QueryExecutionTree::readFromMaterializedView() {
 std::shared_ptr<QueryExecutionTree>
 QueryExecutionTree::createSortedTreeAnyPermutation(
     std::shared_ptr<QueryExecutionTree> qet,
-    const std::vector<ColumnIndex>& sortColumns) {
+    const qlm::vector<ColumnIndex>& sortColumns) {
   const auto& sortedOn = qet->resultSortedOn();
   ql::span relevantSortedCols{sortedOn.begin(),
                               std::min(sortedOn.size(), sortColumns.size())};
@@ -208,22 +219,49 @@ QueryExecutionTree::createSortedTreeAnyPermutation(
   return isSorted ? qet : createSortedTree(std::move(qet), sortColumns);
 }
 
+std::shared_ptr<QueryExecutionTree>
+QueryExecutionTree::createSortedTreeAnyPermutation(
+    std::shared_ptr<QueryExecutionTree> qet,
+    const std::vector<ColumnIndex>& sortColumns) {
+  // TODO<vrbommireddy>: Remove this conversion once all callers pass
+  // `qlm::vector` directly.
+  qlm::vector<ColumnIndex> converted{sortColumns.begin(), sortColumns.end(),
+                                     qet->getRootOperation()->allocator()};
+  return createSortedTreeAnyPermutation(std::move(qet), converted);
+}
+
+std::shared_ptr<QueryExecutionTree>
+QueryExecutionTree::createSortedTreeAnyPermutation(
+    std::shared_ptr<QueryExecutionTree> qet,
+    std::initializer_list<ColumnIndex> sortColumns) {
+  return createSortedTreeAnyPermutation(std::move(qet),
+                                        std::vector<ColumnIndex>{sortColumns});
+}
+
 // ________________________________________________________________________________________________________________
 std::shared_ptr<QueryExecutionTree> QueryExecutionTree::createSortedTree(
     std::shared_ptr<QueryExecutionTree> qet,
-    const std::vector<ColumnIndex>& sortColumns, bool explicitSort) {
+    const qlm::vector<ColumnIndex>& sortColumns, bool explicitSort) {
   const auto& rootOperation = qet->getRootOperation();
-  if (rootOperation->isSortedBy(sortColumns)) {
+  // TODO<vrbommireddy>: Remove this conversion once Operation accepts
+  // allocator-aware sorted-column vectors.
+  std::vector<ColumnIndex> sortColumnsStd{sortColumns.begin(),
+                                          sortColumns.end()};
+  if (rootOperation->isSortedBy(sortColumnsStd)) {
     return qet;
   }
-  auto sortedQet = rootOperation->makeSortedTree(sortColumns);
+  auto sortedQet = rootOperation->makeSortedTree(sortColumnsStd);
 
   if (sortedQet.has_value()) {
     AD_CORRECTNESS_CHECK(sortedQet.value() != nullptr);
+    // The new root operation is built from the children of `rootOperation`, so
+    // the variables hidden in the latter would become visible again.
+    rootOperation->keepHiddenVariablesHidden(
+        *sortedQet.value()->getRootOperation());
     AD_CORRECTNESS_CHECK(qet->getVariableColumns() ==
                          sortedQet.value()->getVariableColumns());
     const auto& sortedRootOperation = sortedQet.value()->getRootOperation();
-    AD_CORRECTNESS_CHECK(sortedRootOperation->isSortedBy(sortColumns));
+    AD_CORRECTNESS_CHECK(sortedRootOperation->isSortedBy(sortColumnsStd));
     AD_CORRECTNESS_CHECK(
         sortedRootOperation->getLimitOffset().isUnconstrained(),
         "`LIMIT` and `OFFSET` are applied by "
@@ -239,23 +277,37 @@ std::shared_ptr<QueryExecutionTree> QueryExecutionTree::createSortedTree(
     // This holds because it is not propagated to the children, so no size
     // estimate that an algorithm choice depends on changes (see the caution
     // note on `Operation::applyLimitOffset`).
-    AD_CORRECTNESS_CHECK(sortedRootOperation->isSortedBy(sortColumns));
+    AD_CORRECTNESS_CHECK(sortedRootOperation->isSortedBy(sortColumnsStd));
     return std::move(sortedQet).value();
   }
 
   return ad_utility::makeExecutionTree<Sort>(
-      rootOperation->getExecutionContext(), std::move(qet), sortColumns,
-      explicitSort);
+      rootOperation->getExecutionContext(), std::move(qet),
+      std::move(sortColumnsStd), explicitSort);
+}
+
+std::shared_ptr<QueryExecutionTree> QueryExecutionTree::createSortedTree(
+    std::shared_ptr<QueryExecutionTree> qet,
+    const std::vector<ColumnIndex>& sortColumns, bool explicitSort) {
+  // TODO<vrbommireddy>: Remove this conversion once all callers pass
+  // `qlm::vector` directly.
+  qlm::vector<ColumnIndex> converted{sortColumns.begin(), sortColumns.end(),
+                                     qet->getRootOperation()->allocator()};
+  return createSortedTree(std::move(qet), converted, explicitSort);
 }
 
 // ________________________________________________________________________________________________________________
 std::shared_ptr<QueryExecutionTree> QueryExecutionTree::createDistinctTree(
     std::shared_ptr<QueryExecutionTree> qet,
-    const std::vector<ColumnIndex>& distinctIndices) {
+    ql::span<const ColumnIndex> distinctIndices) {
   const auto& rootOperation = qet->getRootOperation();
+  // TODO<vrbommireddy>: Remove this conversion once Operation accepts
+  // allocator-aware sorted-column vectors.
+  std::vector<ColumnIndex> distinctIndicesStd{distinctIndices.begin(),
+                                              distinctIndices.end()};
   // If the result is already distinct wrt the `distinctIndices`, the `DISTINCT`
   // would be a no-op and we can simply return the tree unchanged.
-  if (rootOperation->isDistinctBy(distinctIndices)) {
+  if (rootOperation->isDistinctBy(distinctIndicesStd)) {
     return qet;
   }
 
@@ -273,9 +325,12 @@ std::shared_ptr<QueryExecutionTree> QueryExecutionTree::createDistinctTree(
 
   // Give the root operation the chance to push the `DISTINCT` down into its
   // subtree(s) more efficiently (e.g. `CartesianProductJoin`).
-  auto distinctQet = rootOperation->makeDistinctTree(distinctIndices);
+  auto distinctQet = rootOperation->makeDistinctTree(distinctIndicesStd);
   if (distinctQet.has_value()) {
     AD_CORRECTNESS_CHECK(distinctQet.value() != nullptr);
+    // See the comment in `createSortedTree` above.
+    rootOperation->keepHiddenVariablesHidden(
+        *distinctQet.value()->getRootOperation());
     // Pushing the `DISTINCT` down must preserve the set of visible variables,
     // but the exact column layout may change: e.g. pushing into a
     // `CartesianProductJoin` can collapse a child to a single row, which
@@ -294,20 +349,20 @@ std::shared_ptr<QueryExecutionTree> QueryExecutionTree::createDistinctTree(
     // layout of the rewritten tree via the variable names before checking.
     std::vector<ColumnIndex> translatedIndices;
     for (const auto& [variable, info] : before) {
-      if (ad_utility::contains(distinctIndices, info.columnIndex_)) {
+      if (ad_utility::contains(distinctIndicesStd, info.columnIndex_)) {
         translatedIndices.push_back(after.at(variable).columnIndex_);
       }
     }
     // The sizes can only match because `distinctIndices` contains no
     // duplicates (a documented precondition of this function).
-    AD_CORRECTNESS_CHECK(translatedIndices.size() == distinctIndices.size());
+    AD_CORRECTNESS_CHECK(translatedIndices.size() == distinctIndicesStd.size());
     AD_CORRECTNESS_CHECK(distinctQet.value()->getRootOperation()->isDistinctBy(
         translatedIndices));
     return std::move(distinctQet).value();
   }
 
   return ad_utility::makeExecutionTree<Distinct>(
-      rootOperation->getExecutionContext(), std::move(qet), distinctIndices);
+      rootOperation->getExecutionContext(), std::move(qet), distinctIndicesStd);
 }
 
 // _____________________________________________________________________________
@@ -318,13 +373,10 @@ QueryExecutionTree::makeTreeWithStrippedColumns(
     HideStrippedColumns hideStrippedColumns) {
   // If all variables of this tree are part of `variablesToKeep`, we can simply
   // return the original tree, without stripping any columns.
-  if (ql::ranges::all_of(qet->getVariableColumns() | ql::views::keys,
-                         [&variablesToKeep](const Variable& variable) {
-                           return ad_utility::contains(variablesToKeep,
-                                                       variable);
-                         })) {
+  if (columnStrippingHelpers::allVariablesAreRequired(*qet, variablesToKeep)) {
     return qet;
   }
+
   const auto& rootOperation = qet->getRootOperation();
   auto optTree = rootOperation->makeTreeWithStrippedColumns(variablesToKeep);
   if (!optTree.has_value()) {
@@ -397,6 +449,13 @@ QueryExecutionTree::createSortedTrees(
 
   return {createSortedTree(std::move(qetA), sortColumnsA),
           createSortedTree(std::move(qetB), sortColumnsB)};
+}
+
+std::shared_ptr<QueryExecutionTree> QueryExecutionTree::createSortedTree(
+    std::shared_ptr<QueryExecutionTree> qet,
+    std::initializer_list<ColumnIndex> sortColumns, bool explicitSort) {
+  return createSortedTree(std::move(qet), std::vector<ColumnIndex>{sortColumns},
+                          explicitSort);
 }
 
 // ____________________________________________________________________________

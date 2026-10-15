@@ -42,8 +42,8 @@
 #include "engine/spatialJoinAlgorithms/S2GeometryAlgorithm.h"
 #include "engine/spatialJoinAlgorithms/S2PointPolylineAlgorithm.h"
 #include "global/Constants.h"
+#include "global/Id.h"
 #include "global/RuntimeParameters.h"
-#include "global/ValueId.h"
 #include "parser/ParsedQuery.h"
 #include "rdfTypes/GeoSparqlHelpers.h"
 #include "util/AllocatorWithLimit.h"
@@ -154,8 +154,8 @@ std::optional<De9imFilterString> SpatialJoin::getDe9imFilter() const {
 }
 
 // ____________________________________________________________________________
-std::vector<QueryExecutionTree*> SpatialJoin::getChildrenImpl() const {
-  std::vector<QueryExecutionTree*> result;
+qlm::vector<QueryExecutionTree*> SpatialJoin::getChildrenImpl() const {
+  qlm::vector<QueryExecutionTree*> result{allocator()};
   auto addChild = [&](std::shared_ptr<QueryExecutionTree> child) {
     if (child) {
       result.push_back(child.get());

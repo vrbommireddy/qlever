@@ -367,6 +367,84 @@ TEST(QueryPlanner, testFilterAfterJoin) {
       qec);
 }
 
+// Regression test for https://github.com/ad-freiburg/qlever/issues/3429 : A
+// filter must not be applied to a subtree in which one of its variables might
+// be UNDEF, because a subsequent join can still bind that variable, in which
+// case the filter has to be evaluated on the bound value.
+TEST(QueryPlanner, filtersAreNotAppliedToPossiblyUndefinedVariables) {
+  auto scan = h::IndexScanFromStrings;
+  auto qec = ad_utility::testing::getQec("<s> <r> <x>. <s> <r2> <y>.");
+
+  // `?p` might be UNDEF because of the `VALUES` clause. Applying the filter
+  // directly to the `VALUES` clause would remove the UNDEF row and thus make
+  // the whole result empty, although the correct result is "all triples with a
+  // predicate other than `<r>`".
+  auto undefValues = h::ValuesClause("VALUES (?p) { (UNDEF) }");
+  std::string queryWithUndef =
+      "SELECT * { ?s ?p ?o . FILTER(?p != <r>) VALUES ?p { UNDEF } }";
+  // The greedy planner applies the filter to the index scan, where `?p` is
+  // always defined.
+  h::expectGreedy(queryWithUndef,
+                  h::Join(h::Sort(undefValues),
+                          h::Filter("?p != <r>", scan("?s", "?p", "?o"))),
+                  qec);
+  // The dynamic programming planner applies it after the join.
+  h::expectDynamicProgramming(
+      queryWithUndef,
+      h::Filter("?p != <r>",
+                h::Join(h::Sort(undefValues), scan("?s", "?p", "?o"))),
+      qec);
+
+  // The definedness is tracked per variable: `?s` is always defined by the
+  // `VALUES` clause, so the filter on `?s` may still be applied to it (and to
+  // the index scan), while the filter on the possibly undefined `?o` may only
+  // be applied at the very end.
+  std::string queryWithTwoFilters =
+      "SELECT * { ?s <r> ?x . VALUES (?s ?o) { (<s> UNDEF) } "
+      "FILTER(?s != <x>) FILTER(?o != <y>) }";
+  auto valuesWithFilter = h::Sort(h::Filter(
+      "?s != <x>", h::ValuesClause("VALUES (?s\t?o) { (<s> UNDEF) }")));
+  h::expectGreedy(
+      queryWithTwoFilters,
+      h::Filter("?o != <y>",
+                h::Join(valuesWithFilter,
+                        h::Filter("?s != <x>", scan("?s", "<r>", "?x")))),
+      qec);
+
+  // Sanity check that filters are still applied as early as possible if all
+  // their variables are always defined.
+  h::expectGreedy(
+      "SELECT * { ?s ?p ?o . FILTER(?p != <r>) VALUES ?p { <r2> } }",
+      h::Join(h::Sort(h::Filter("?p != <r>",
+                                h::ValuesClause("VALUES (?p) { (<r2>) }"))),
+              h::Filter("?p != <r>", scan("?s", "?p", "?o"))),
+      qec);
+}
+
+// Test that a non-deterministic filter is applied only at the end of the
+// group graph pattern, not to one side of a join.
+TEST(QueryPlanner, nonDeterministicFiltersAreAppliedLast) {
+  auto scan = h::IndexScanFromStrings;
+  auto join = h::Join(scan("?s", "<p>", "?o"), scan("?s", "<q>", "?y"));
+  h::expectGreedy("SELECT * { ?s <p> ?o . ?s <q> ?y FILTER(?o > 3) }",
+                  h::Join(h::Filter("?o > 3", scan("?s", "<p>", "?o")),
+                          scan("?s", "<q>", "?y")));
+  h::expectGreedy(
+      "SELECT * { ?s <p> ?o . ?s <q> ?y FILTER(?o > 3 && RAND() < 0.5) }",
+      h::Filter("?o > 3 && RAND() < 0.5", join));
+  h::expectGreedy("SELECT * { ?s <p> ?o . ?s <q> ?y FILTER(RAND() < 0.5) }",
+                  h::Filter("RAND() < 0.5", join));
+  h::expectDynamicProgramming(
+      "SELECT * { ?s <p> ?o . ?s <q> ?y FILTER(RAND() < 0.5) }",
+      h::Filter("RAND() < 0.5", join));
+  // The same holds for an `EXISTS` with a non-deterministic argument.
+  h::expectGreedy(
+      "SELECT * { ?s <p> ?o . ?s <q> ?y "
+      "FILTER EXISTS { ?s <r> ?b FILTER(RAND() < 0.5) } }",
+      h::Filter("EXISTS { ?s <r> ?b FILTER(RAND() < 0.5) }",
+                h::ExistsJoin(join, ::testing::_)));
+}
+
 TEST(QueryPlanner, threeVarTriples) {
   auto scan = h::IndexScanFromStrings;
   using enum Permutation::Enum;
@@ -613,8 +691,8 @@ TEST(QueryExecutionTreeTest, testFormerSegfaultTriFilter) {
       "} LIMIT 300");
   QueryPlanner qp = makeQueryPlanner();
   auto qet = qp.createExecutionTree(pq);
-  ASSERT_TRUE(qet->isVariableCovered(Variable{"?1"}));
-  ASSERT_TRUE(qet->isVariableCovered(Variable{"?0"}));
+  ASSERT_TRUE(qet->containsVariable(Variable{"?1"}));
+  ASSERT_TRUE(qet->containsVariable(Variable{"?0"}));
 }
 
 TEST(QueryPlanner, testSimpleOptional) {
@@ -2716,6 +2794,18 @@ TEST(QueryPlanner, Describe) {
       h::Describe(::testing::_, h::IndexScanFromStrings(
                                     "?y", "<p>", "<o>", {},
                                     ad_utility::HashSet<std::string>{"<g>"})));
+  // A trailing `VALUES` clause restricts the WHERE clause (the input of the
+  // `Describe`), not the result of the `Describe`.
+  h::expect(
+      "DESCRIBE ?y { ?y <p> ?o } VALUES ?y { <a> }",
+      h::Describe(::testing::_,
+                  h::Join(h::IndexScanFromStrings("?y", "<p>", "?o"),
+                          h::Sort(h::ValuesClause("VALUES (?y) { (<a>) }")))));
+  // The same holds for LIMIT and OFFSET.
+  h::expect("DESCRIBE ?y { ?y <p> ?o } LIMIT 2 OFFSET 1",
+            h::Describe(::testing::_,
+                        h::WithLimitOffset({2, 1}, h::IndexScanFromStrings(
+                                                       "?y", "<p>", "?o"))));
 }
 
 // ____________________________________________________________________________
@@ -2835,6 +2925,68 @@ TEST(QueryPlanner, Exists) {
                                                   {Permutation::Enum::OSP}),
                           h::IndexScanFromStrings("?s", "?p", "?o",
                                                   {Permutation::Enum::SPO}))));
+
+  // A `FILTER` with an `EXISTS` may be applied to several subtrees, which then
+  // must not share the column of the `ExistsJoin` (see GitHub issue #3555).
+  auto filterExistsEmpty = [](const auto& subtree) {
+    return h::Filter("EXISTS {}", h::ExistsJoin(subtree, h::NeutralElement()));
+  };
+  h::expect(
+      "SELECT * { ?x ?y ?z . ?a ?b ?c FILTER EXISTS {} }",
+      h::CartesianProductJoin(filterExistsEmpty(xyz), filterExistsEmpty(abc)));
+  auto filterExistsSRB = [](const auto& subtree) {
+    return h::Filter(
+        "EXISTS { ?s <r> ?b }",
+        h::ExistsJoin(subtree, h::IndexScanFromStrings("?s", "<r>", "?b")));
+  };
+  h::expectGreedy(
+      "SELECT * { ?s <p> ?o . ?s <q> ?y FILTER EXISTS { ?s <r> ?b } }",
+      h::Join(filterExistsSRB(h::IndexScanFromStrings("?s", "<p>", "?o")),
+              filterExistsSRB(h::IndexScanFromStrings("?s", "<q>", "?y"))));
+
+  // The `ExistsJoin` adds a column for the result of the `EXISTS`, which is
+  // then hidden by the `Filter`.
+  using ::testing::Pair;
+  auto variableColumnsAre = [](auto... columns) {
+    return AD_PROPERTY(QueryExecutionTree, getVariableColumns,
+                       ::testing::UnorderedElementsAre(columns...));
+  };
+  auto column = [](const std::string& variable, ColumnIndex columnIndex) {
+    return Pair(Var{variable}, makeAlwaysDefinedColumn(columnIndex));
+  };
+  auto existsColumn = [](ColumnIndex columnIndex) {
+    return Pair(AD_PROPERTY(Var, name, HasSubstr("?ql_internal_exists_")),
+                makeAlwaysDefinedColumn(columnIndex));
+  };
+  auto filterExistsSRBWithColumns =
+      [&](const auto& subtree,
+          const std::string& otherVariable) -> h::QetMatcher {
+    return ::testing::AllOf(
+        h::Filter(
+            "EXISTS { ?s <r> ?b }",
+            ::testing::AllOf(
+                h::ExistsJoin(subtree,
+                              h::IndexScanFromStrings("?s", "<r>", "?b")),
+                variableColumnsAre(column("?s", 0), column(otherVariable, 1),
+                                   existsColumn(2)))),
+        variableColumnsAre(column("?s", 0), column(otherVariable, 1)));
+  };
+  h::expect("SELECT * { ?s <p> ?o FILTER EXISTS { ?s <r> ?b } }",
+            filterExistsSRBWithColumns(
+                h::IndexScanFromStrings("?s", "<p>", "?o"), "?o"));
+  h::expectGreedy(
+      "SELECT * { ?s <p> ?o . ?s <q> ?y FILTER EXISTS { ?s <r> ?b } }",
+      ::testing::AllOf(
+          h::Join(filterExistsSRBWithColumns(
+                      h::IndexScanFromStrings("?s", "<p>", "?o"), "?o"),
+                  filterExistsSRBWithColumns(
+                      h::IndexScanFromStrings("?s", "<q>", "?y"), "?y")),
+          // The hidden columns of the `ExistsJoin`s are still present in the
+          // result (columns 2 and 4), but not visible.
+          // TODO<StripColumns> Adapt once `Filter` can strip columns.
+          AD_PROPERTY(QueryExecutionTree, getResultWidth, ::testing::Eq(5)),
+          variableColumnsAre(column("?s", 0), column("?o", 1),
+                             column("?y", 3))));
 }
 
 // _____________________________________________________________________________
@@ -3207,7 +3359,17 @@ TEST(QueryPlanner, postQueryValuesClause) {
   h::expect("SELECT ?s ?p1 ?o1 { ?s ?p1 ?o1 } VALUES ?p1 { <pred> }",
             h::Join(h::IndexScanFromStrings("?s", "?p1", "?o1"),
                     h::Sort(h::ValuesClause("VALUES (?p1) { (<pred>) }"))));
-  h::expect("SELECT * { } VALUES () { () }", h::NeutralElement());
+  h::expect("SELECT * { } VALUES () { () }",
+            h::CartesianProductJoin(h::NeutralElement(),
+                                    h::ValuesClause("VALUES () { () }")));
+  // Without variables, the trailing `VALUES` clause must not be ignored: zero
+  // rows make the result empty and multiple rows duplicate its rows.
+  h::expect("SELECT ?s { ?s ?p ?o } VALUES () { }",
+            h::CartesianProductJoin(h::IndexScanFromStrings("?s", "?p", "?o"),
+                                    h::ValuesClause("VALUES () {  }")));
+  h::expect("SELECT ?s { ?s ?p ?o } VALUES () { () () }",
+            h::CartesianProductJoin(h::IndexScanFromStrings("?s", "?p", "?o"),
+                                    h::ValuesClause("VALUES () { () () }")));
   h::expect(
       "SELECT * { } VALUES (?x ?y) { (1 2) }",
       h::CartesianProductJoin(h::NeutralElement(),
@@ -4082,4 +4244,70 @@ TEST(QueryPlanner, nonDeterministicOperandNotDistributedOverUnion) {
       // the join has to be on top!
       h::Join(::testing::A<const QueryExecutionTree&>(),
               ::testing::A<const QueryExecutionTree&>()));
+}
+
+// Test the information about how each connected component of a query was
+// planned.
+TEST(QueryPlanner, planningInfo) {
+  // The information for the given query.
+  auto planningInfo = [](std::string query) {
+    QueryPlanner qp = makeQueryPlanner();
+    ParsedQuery pq = parseQuery(std::move(query));
+    qp.createExecutionTree(pq);
+    return qp.planningInfo();
+  };
+
+  // A path of three triples is one connected component, with six connected
+  // subgraphs (three single triples, two pairs, and all three).
+  auto info = planningInfo("SELECT * { ?x <p> ?y . ?y <q> ?z . ?z <r> ?w }");
+  ASSERT_EQ(info.size(), 1u);
+  EXPECT_EQ(info[0].algorithm_, PlanningAlgorithm::DYNAMIC_PROGRAMMING);
+  EXPECT_EQ(info[0].numNodes_, 3u);
+  EXPECT_EQ(info[0].numConnectedSubgraphs_, 6u);
+  EXPECT_EQ(info[0].budget_,
+            getRuntimeParameter<&RuntimeParameters::queryPlanningBudget_>());
+  EXPECT_GT(info[0].numCandidatePlans_, 0u);
+
+  // Two connected components, with a budget of one.
+  auto cleanup =
+      setRuntimeParameterForTest<&RuntimeParameters::queryPlanningBudget_>(1);
+  info = planningInfo("SELECT * { ?x <p> ?y . ?y <q> ?z . ?a <r> ?b }");
+  ASSERT_EQ(info.size(), 2u);
+  ql::ranges::sort(info, {}, &ConnectedComponentPlanningInfo::numNodes_);
+
+  // The component with a single triple has one connected subgraph and needs no
+  // joins.
+  EXPECT_EQ(info[0].algorithm_, PlanningAlgorithm::DYNAMIC_PROGRAMMING);
+  EXPECT_EQ(info[0].numNodes_, 1u);
+  EXPECT_EQ(info[0].numConnectedSubgraphs_, 1u);
+  EXPECT_EQ(info[0].numCandidatePlans_, 0u);
+
+  // The component with two triples has three connected subgraphs, of which
+  // only two are counted (the counting stops at the budget plus one), so it is
+  // planned greedily.
+  EXPECT_EQ(info[1].algorithm_, PlanningAlgorithm::GREEDY);
+  EXPECT_EQ(info[1].numNodes_, 2u);
+  EXPECT_EQ(info[1].numConnectedSubgraphs_, 2u);
+  EXPECT_EQ(info[1].budget_, 1u);
+  EXPECT_GT(info[1].numCandidatePlans_, 0u);
+}
+
+// Test that the operations and execution trees that the query planner creates
+// are allocated via the memory-limited allocator of the query.
+TEST(QueryPlanner, plannerAllocationsCountTowardsMemoryLimit) {
+  auto* qec = ad_utility::testing::getQec();
+  const auto& allocator = qec->getAllocator();
+  const auto memoryLeftBefore = allocator.amountMemoryLeft();
+
+  // While the execution tree of a single index scan lives, the memory limit of
+  // the query accounts for the tree and the scan (and not only for the runtime
+  // information of the scan, which the `Operation` constructor allocates).
+  {
+    auto tree = h::parseAndPlan("SELECT * { ?x <p> ?y }", qec);
+    auto used = memoryLeftBefore - allocator.amountMemoryLeft();
+    EXPECT_GE(used.getBytes(), sizeof(IndexScan) + sizeof(QueryExecutionTree));
+  }
+
+  // When the tree is destroyed, the memory is released again.
+  EXPECT_EQ(allocator.amountMemoryLeft(), memoryLeftBefore);
 }
